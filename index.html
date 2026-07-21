@@ -305,20 +305,33 @@ const FFMPEG_CORE_WASM_B64='AGFzbQEAAAABmBagAmADf39/AGAEf39/fwBgAn9/AGABfwF/YAR/
   }
   function loop(){draw();if(!video.paused&&!video.ended){if(video.requestVideoFrameCallback)video.requestVideoFrameCallback(loop);else requestAnimationFrame(loop)}else drawing=false}
   function startLoop(){if(!drawing){drawing=true;loop()}}
+  function waitForMedia(target,success,error='error',timeout=15000){
+    return new Promise((resolve,reject)=>{
+      let timer;
+      const done=value=>{clearTimeout(timer);target.removeEventListener(success,onSuccess);target.removeEventListener(error,onError);value instanceof Error?reject(value):resolve(value)};
+      const onSuccess=()=>done();
+      const onError=()=>done(new Error(target.error?.message||`Video ${error}`));
+      target.addEventListener(success,onSuccess,{once:true});target.addEventListener(error,onError,{once:true});
+      timer=setTimeout(()=>done(new Error(`Timed out waiting for video ${success}`)),timeout);
+    });
+  }
   async function loadFile(file){
-    if(!file||!file.type.startsWith('video/'))return;
-    sourceFile=file;
-    if(objectURL)URL.revokeObjectURL(objectURL);objectURL=URL.createObjectURL(file);video.src=objectURL;video.load();
+    if(!file||(!file.type.startsWith('video/')&&!/\.(mp4|m4v|mov|webm|mkv|avi|mpeg|mpg)$/i.test(file.name)))return;
+    const nextURL=URL.createObjectURL(file);video.pause();video.removeAttribute('src');video.load();
+    if(objectURL)URL.revokeObjectURL(objectURL);objectURL=nextURL;sourceFile=file;video.src=objectURL;video.load();
     $('filename').textContent=file.name;$('status').textContent='Reading video…';
-    await new Promise((resolve,reject)=>{video.onloadedmetadata=resolve;video.onerror=reject});
-    await ensureKeyFonts(allKeyText());
-    canvas.width=video.videoWidth;canvas.height=video.videoHeight;$('scrubber').max=video.duration;$('duration').textContent=fmt(video.duration);
-    $('end').value=Math.min(5,video.duration).toFixed(1);$('start').max=video.duration;$('end').max=video.duration;
-    $('empty').style.display='none';$('videoWrap').classList.add('active');$('transport').classList.add('active');$('fileline').classList.add('active');$('hardwareExportBtn').disabled=false;$('exportBtn').disabled=false;$('smartExportBtn').disabled=false;
-    $('status').textContent='Ready to export';updateOutputs();draw();
+    try{
+      await waitForMedia(video,'loadedmetadata');
+      if(!Number.isFinite(video.duration)||video.duration<=0||!video.videoWidth||!video.videoHeight)throw new Error('The video has invalid or unsupported media metadata.');
+      await ensureKeyFonts(allKeyText());
+      canvas.width=video.videoWidth;canvas.height=video.videoHeight;$('scrubber').max=video.duration;$('duration').textContent=fmt(video.duration);
+      $('end').value=Math.min(5,video.duration).toFixed(1);$('start').max=video.duration;$('end').max=video.duration;
+      $('empty').style.display='none';$('videoWrap').classList.add('active');$('transport').classList.add('active');$('fileline').classList.add('active');$('hardwareExportBtn').disabled=false;$('exportBtn').disabled=false;$('smartExportBtn').disabled=false;
+      $('status').textContent='Ready to export';updateOutputs();draw();
+    }catch(error){console.error(error);sourceFile=null;$('status').textContent=error.message||'This video cannot be opened in this browser';video.removeAttribute('src');video.load()}
   }
   function updateOutputs(){syncInputsToKey();refreshLabels();keysChanged()}
-  async function togglePlay(){if(!video.src)return;if(video.ended)video.currentTime=0;if(video.paused){await video.play();$('playBtn').textContent='❚❚';startLoop()}else{video.pause();$('playBtn').textContent='▶';draw()}}
+  async function togglePlay(){if(!video.src)return;if(video.ended)video.currentTime=0;if(video.paused){try{await video.play();$('playBtn').textContent='❚❚';startLoop()}catch(error){console.error(error);$('status').textContent='Playback could not start for this video'}}else{video.pause();$('playBtn').textContent='▶';draw()}}
   function pickMime(){const types=['video/mp4;codecs="avc1.42E01E,mp4a.40.2"','video/mp4','video/webm;codecs=vp9,opus','video/webm;codecs=vp8,opus','video/webm'];return types.find(t=>window.MediaRecorder&&MediaRecorder.isTypeSupported(t))||''}
   async function ensureAudio(){
     if(audioContext)return; audioContext=new (window.AudioContext||window.webkitAudioContext)();audioSource=audioContext.createMediaElementSource(video);audioDest=audioContext.createMediaStreamDestination();audioSource.connect(audioDest);audioSource.connect(audioContext.destination);
@@ -380,18 +393,23 @@ const FFMPEG_CORE_WASM_B64='AGFzbQEAAAABmBagAmADf39/AGAEf39/fwBgAn9/AGABfwF/YAR/
     trak.boxes.splice(1,0,edts);trak.edts=edts;
   }
   async function waitForCodecQueue(codec,limit){
-    while(codec.state==='configured'&&codec.decodeQueueSize>limit){
+    const queueName=codec instanceof VideoDecoder?'decodeQueueSize':'encodeQueueSize';
+    while(codec.state==='configured'&&codec[queueName]>limit){
       await Promise.race([new Promise(resolve=>codec.addEventListener('dequeue',resolve,{once:true})),new Promise(resolve=>setTimeout(resolve,12))]);
     }
   }
+  function withTimeout(promise,ms,label){
+    let timer;return Promise.race([promise,new Promise((_,reject)=>{timer=setTimeout(()=>reject(new Error(`${label} timed out`)),ms)})]).finally(()=>clearTimeout(timer));
+  }
   async function encoderConfiguration(track,width,height,framerate){
     const bitrate=Math.round(Math.min(30000000,Math.max(track.bitrate||0,width*height*framerate*.11,2500000)));
-    const codecs=[track.codec,'avc1.640028','avc1.4d0028','avc1.42001f'].filter((codec,index,list)=>codec?.startsWith('avc1')&&list.indexOf(codec)===index);
-    for(const codec of codecs){
-      const config={codec,width,height,bitrate,framerate,hardwareAcceleration:'prefer-hardware',latencyMode:'realtime',bitrateMode:'variable',avc:{format:'avc'}};
-      try{const result=await VideoEncoder.isConfigSupported(config);if(result.supported)return result.config}catch{}
+    const pixels=width*height,level=pixels<=1280*720?'1f':pixels<=1920*1080?'2a':'33';
+    const codecs=[`avc1.42e0${level}`,`avc1.4d00${level}`,track.codec,'avc1.640033'].filter((codec,index,list)=>codec?.startsWith('avc1')&&list.indexOf(codec)===index);
+    for(const hardwareAcceleration of ['prefer-hardware','no-preference'])for(const codec of codecs){
+      const config={codec,width,height,displayWidth:width,displayHeight:height,bitrate,framerate,hardwareAcceleration,latencyMode:'quality',bitrateMode:'variable',alpha:'discard',avc:{format:'avc'}};
+      try{const result=await VideoEncoder.isConfigSupported(config);if(result.supported)return {...config,...result.config,avc:{format:'avc'}}}catch{}
     }
-    throw new Error('Hardware H.264 encoding is not available in this browser. Use the real-time export instead.');
+    throw new Error('WebCodecs H.264 encoding is not available in this browser. Use the FFmpeg compatibility export instead.');
   }
   async function encodeVideoTrack(parsed,s){
     const {MP4Box,iso,info,videoTrack,videoSamples}=parsed,trak=iso.getTrackById(videoTrack.id),entry=trak.mdia.minf.stbl.stsd.entries[0];
@@ -399,21 +417,23 @@ const FFMPEG_CORE_WASM_B64='AGFzbQEAAAABmBagAmADf39/AGAEf39/fwBgAn9/AGABfwF/YAR/
     const width=videoTrack.video.width,height=videoTrack.video.height;
     const frameDurations=videoSamples.map(sample=>sample.duration/sample.timescale).sort((a,b)=>a-b),frameDuration=frameDurations[Math.floor(frameDurations.length/2)]||1/30;
     const framerate=Math.max(1,Math.min(120,1/frameDuration)),frameDurationUs=Math.round(frameDuration*1000000),movieDuration=info.duration/info.timescale;
-    const config=await encoderConfiguration(videoTrack,width,height,framerate),encoded=[];let decoderDescription=null,codecError=null,renderError=null,rendered=0;
+    const config=await encoderConfiguration(videoTrack,width,height,framerate),encoded=[];let decoderDescription=null,codecError=null,renderError=null,rendered=0,outputOrder=0;
     const encoder=new VideoEncoder({
       output(chunk,metadata){
         const data=new Uint8Array(chunk.byteLength);chunk.copyTo(data);
         if(metadata?.decoderConfig?.description)decoderDescription=copyBuffer(metadata.decoderConfig.description);
-        encoded.push({data,timestamp:chunk.timestamp,duration:chunk.duration||frameDurationUs,type:chunk.type});
+        encoded.push({data,timestamp:chunk.timestamp,duration:chunk.duration||frameDurationUs,type:chunk.type,outputOrder:outputOrder++});
       },
       error(error){codecError=error}
     });
-    encoder.configure(config);
-    await ensureKeyFonts(allKeyText());
-    const renderCanvas=document.createElement('canvas');renderCanvas.width=width;renderCanvas.height=height;
-    const renderContext=renderCanvas.getContext('2d',{alpha:false,colorSpace:'srgb'});if(!renderContext)throw new Error('Could not create the video compositor.');
-    const keyEvery=Math.max(1,Math.round(framerate*2));
-    const decoder=new VideoDecoder({
+    let decoder=null;
+    try{
+      encoder.configure(config);
+      await ensureKeyFonts(allKeyText());
+      const renderCanvas=document.createElement('canvas');renderCanvas.width=width;renderCanvas.height=height;
+      const renderContext=renderCanvas.getContext('2d',{alpha:false,colorSpace:'srgb'});if(!renderContext)throw new Error('Could not create the video compositor.');
+      const keyEvery=Math.max(1,Math.round(framerate*2));
+      decoder=new VideoDecoder({
       output(frame){
         try{
           if(frame.timestamp<0||frame.timestamp>=Math.round(movieDuration*1000000))return;
@@ -425,20 +445,35 @@ const FFMPEG_CORE_WASM_B64='AGFzbQEAAAABmBagAmADf39/AGAEf39/fwBgAn9/AGABfwF/YAR/
         }catch(error){renderError=error}finally{frame.close()}
       },
       error(error){codecError=error}
-    });
-    decoder.configure({codec:videoTrack.codec,codedWidth:width,codedHeight:height,description:boxPayload(MP4Box,entry.avcC),hardwareAcceleration:'prefer-hardware',optimizeForLatency:true});
-    const mediaStart=editMediaTime(trak,videoSamples);
-    for(let index=0;index<videoSamples.length;index++){
-      if(codecError||renderError)throw codecError||renderError;
-      const sample=videoSamples[index],timestamp=Math.round((sample.cts-mediaStart)*1000000/sample.timescale),duration=Math.round(sample.duration*1000000/sample.timescale);
-      decoder.decode(new EncodedVideoChunk({type:sample.is_sync?'key':'delta',timestamp,duration,data:sample.data}));
-      if(decoder.decodeQueueSize>10)await waitForCodecQueue(decoder,5);
-      while(encoder.encodeQueueSize>14)await new Promise(resolve=>setTimeout(resolve,8));
+      });
+      const description=boxPayload(MP4Box,entry.avcC),baseDecoderConfig={codec:videoTrack.codec,codedWidth:width,codedHeight:height,description,optimizeForLatency:false};
+      let decoderConfig=null;
+      for(const hardwareAcceleration of ['prefer-hardware','no-preference']){
+        const candidate={...baseDecoderConfig,hardwareAcceleration};
+        try{const support=await VideoDecoder.isConfigSupported(candidate);if(support.supported){decoderConfig={...candidate,...support.config,description};break}}catch{}
+      }
+      if(!decoderConfig)throw new Error('This H.264 stream cannot be decoded by WebCodecs on this device.');
+      decoder.configure(decoderConfig);
+      const mediaStart=editMediaTime(trak,videoSamples);
+      for(let index=0;index<videoSamples.length;index++){
+        if(codecError||renderError)throw codecError||renderError;
+        const sample=videoSamples[index],timestamp=Math.round((sample.cts-mediaStart)*1000000/sample.timescale),duration=Math.max(1,Math.round(sample.duration*1000000/sample.timescale));
+        decoder.decode(new EncodedVideoChunk({type:sample.is_sync?'key':'delta',timestamp,duration,data:sample.data}));
+        if(decoder.decodeQueueSize>10)await waitForCodecQueue(decoder,5);
+        if(encoder.encodeQueueSize>12)await waitForCodecQueue(encoder,6);
+      }
+      await withTimeout(decoder.flush(),120000,'Video decoding');if(renderError)throw renderError;
+      await withTimeout(encoder.flush(),120000,'Video encoding');if(codecError)throw codecError;
+    }finally{
+      if(decoder&&decoder.state!=='closed')decoder.close();
+      if(encoder.state!=='closed')encoder.close();
     }
-    await decoder.flush();if(renderError)throw renderError;await encoder.flush();if(codecError)throw codecError;
-    decoder.close();encoder.close();
     if(!decoderDescription||!encoded.length)throw new Error('The hardware encoder did not return a usable H.264 stream.');
-    encoded.sort((a,b)=>a.timestamp-b.timestamp);
+    encoded.sort((a,b)=>a.outputOrder-b.outputOrder);
+    if(encoded.length!==rendered)throw new Error(`The encoder dropped ${rendered-encoded.length} frame(s); refusing to create a damaged export.`);
+    if(encoded[0].type!=='key')throw new Error('The encoder did not begin with a key frame.');
+    for(let i=1;i<encoded.length;i++)if(encoded[i].timestamp<encoded[i-1].timestamp)throw new Error('The encoder produced reordered frames that cannot be safely muxed by this exporter.');
+    for(const sample of encoded)sample.dts=sample.timestamp;
     const mediaDuration=Math.max(...encoded.map(sample=>sample.timestamp+sample.duration));
     return {encoded,decoderDescription,config,width,height,framerate,frameDurationUs,mediaDuration,movieDuration,sourceEntry:entry,sourceTrak:trak};
   }
@@ -467,12 +502,12 @@ const FFMPEG_CORE_WASM_B64='AGFzbQEAAAABmBagAmADf39/AGAEf39/fwBgAn9/AGABfwF/YAR/
       if(!id)throw new Error(`Could not preserve audio track ${track.id}.`);
       trackIds.set(track.id,id);
     }
-    const events=videoSamples.map(sample=>({kind:'video',time:sample.timestamp/1000000,sample}));
+    const events=videoSamples.map(sample=>({kind:'video',time:sample.dts/1000000,sample}));
     for(const track of info.audioTracks)for(const sample of audioSets.get(track.id))events.push({kind:'audio',track,time:sample.dts/sample.timescale,sample});
     events.sort((a,b)=>a.time-b.time||(a.kind===b.kind?0:a.kind==='video'?-1:1));
     for(const event of events){
       const sample=event.sample;
-      if(event.kind==='video')out.addSample(videoId,sample.data,{duration:Math.max(1,Math.round(sample.duration)),cts:Math.max(0,Math.round(sample.timestamp)),dts:Math.max(0,Math.round(sample.timestamp)),is_sync:sample.type==='key'});
+      if(event.kind==='video')out.addSample(videoId,sample.data,{duration:Math.max(1,Math.round(sample.duration)),cts:Math.max(0,Math.round(sample.timestamp)),dts:Math.max(0,Math.round(sample.dts)),is_sync:sample.type==='key'});
       else out.addSample(trackIds.get(event.track.id),sample.data,{duration:sample.duration,cts:sample.cts,dts:sample.dts,is_sync:sample.is_sync,depends_on:sample.depends_on,is_depended_on:sample.is_depended_on,has_redundancy:sample.has_redundancy,degradation_priority:sample.degradation_priority});
     }
     const stream=out.getBuffer(),buffer=stream.buffer,bytes=new Uint8Array(buffer);
@@ -482,20 +517,40 @@ const FFMPEG_CORE_WASM_B64='AGFzbQEAAAABmBagAmADf39/AGAEf39/fwBgAn9/AGABfwF/YAR/
     if(blob.size!==bytes.byteLength)throw new Error('MP4 download validation failed before save.');
     return blob;
   }
+  async function validateHardwareExport(blob,sourceDuration,sourceAudioTracks){
+    const parsed=await parseMP4Source(blob),track=parsed.videoTrack,samples=parsed.videoSamples||[];
+    const duration=parsed.info.duration/parsed.info.timescale;
+    if(!track.codec?.startsWith('avc1'))throw new Error('Export validation found a non-H.264 video track.');
+    if(!samples.length||!samples[0].is_sync)throw new Error('Export validation found no independently decodable first frame.');
+    if(Math.abs(duration-sourceDuration)>Math.max(.12,sourceDuration*.01))throw new Error('Export validation found a duration mismatch.');
+    if(parsed.info.audioTracks.length!==sourceAudioTracks)throw new Error('Export validation found a missing audio track.');
+    for(const audio of parsed.info.audioTracks)if(audio.codec&&!audio.codec.startsWith('mp4a'))throw new Error('Export validation found incompatible audio.');
+    let previous=-1;for(const sample of samples){if(sample.dts<previous)throw new Error('Export validation found non-monotonic decode timestamps.');previous=sample.dts}
+    return true;
+  }
   function downloadBlob(blob,suffix='keyed'){
     const link=document.createElement('a');link.href=URL.createObjectURL(blob);link.download=`${sourceFile.name.replace(/\.[^.]+$/,'')}-${suffix}.mp4`;link.click();setTimeout(()=>URL.revokeObjectURL(link.href),30000);
   }
   async function hardwareExport(){
     if(exporting||!sourceFile)return;
     exporting=true;setExportControls(true);$('hardwareExportBtn').textContent='Preparing hardware export…';video.pause();
+    const fallbackFiles=['input.mp4','overlay.png','verify.json','output.mp4'];
     try{
-      if(!window.VideoDecoder||!window.VideoEncoder||!window.EncodedVideoChunk||!window.VideoFrame)throw new Error('WebCodecs is not available in this browser. Use the real-time export instead.');
+      if(!window.VideoDecoder||!window.VideoEncoder||!window.EncodedVideoChunk||!window.VideoFrame)throw new Error('WebCodecs is not available in this browser.');
       setProgress(.04,'Reading MP4 tracks…');const parsed=await parseMP4Source(sourceFile);
       setProgress(.1,'Starting the hardware video codecs…');const result=await encodeVideoTrack(parsed,state());
       setProgress(.86,'Copying audio and building the MP4…');const blob=muxHardwareExport(parsed,result);
+      setProgress(.94,'Validating playback structure…');await validateHardwareExport(blob,parsed.info.duration/parsed.info.timescale,parsed.info.audioTracks.length);
       setProgress(1,'Fast seamless export complete');downloadBlob(blob);
-    }catch(error){console.error(error);$('status').textContent=error.message||'Fast export failed — use the real-time export';$('progress').classList.remove('active')}
-    finally{exporting=false;setExportControls(false);$('hardwareExportBtn').textContent='Fast seamless export'}
+    }catch(error){
+      console.error(error);
+      if(keys.length===1){
+        try{await compatibilityFFmpegExport(state(),error)}catch(fallbackError){console.error(fallbackError);$('status').textContent=fallbackError.message||error.message||'Video export failed';$('progress').classList.remove('active')}
+      }else{$('status').textContent=`${error.message||'Fast export failed'} Use Seamless export for multiple keys.`;$('progress').classList.remove('active')}
+    }finally{
+      for(const file of fallbackFiles){try{await ffmpeg?.deleteFile(file)}catch{}}
+      exporting=false;setExportControls(false);$('hardwareExportBtn').textContent='Fast seamless export';
+    }
   }
   class BrowserFFmpeg{
     constructor(){this.worker=null;this.loaded=false;this.loading=null;this.urls=[];this.pending=new Map();this.nextID=1;this.progress=()=>{};this.logs=[]}
@@ -523,25 +578,27 @@ self.onmessage=(event)=>{if(event.data&&event.data.type==='LOAD')event.data.data
       const combinedWorker=`${wasmBootstrap}\n${coreSource}\n;self.createFFmpegCore=createFFmpegCore;\n${workerSource}\n${wasmOverride}`;
       const workerURL=URL.createObjectURL(new Blob([combinedWorker],{type:'text/javascript'}));
       this.urls=[workerURL];
-      this.worker=new Worker(workerURL);this.worker.onmessage=e=>this.receive(e.data);this.worker.onerror=e=>{const error=new Error(e.message||'FFmpeg worker failed to start');for(const task of this.pending.values())task.reject(error);this.pending.clear()};
-      await this.request('LOAD',{coreURL:workerURL});
+      this.worker=new Worker(workerURL);this.worker.onmessage=e=>this.receive(e.data);
+      const workerFailed=e=>{const error=new Error(e?.message||'FFmpeg worker stopped unexpectedly');this.loaded=false;for(const task of this.pending.values()){clearTimeout(task.timer);task.reject(error)}this.pending.clear()};
+      this.worker.onerror=workerFailed;this.worker.onmessageerror=workerFailed;
+      await this.request('LOAD',{coreURL:workerURL},[],45000);
     }
     reset(){
       this.worker?.terminate();this.worker=null;this.loaded=false;for(const url of this.urls)URL.revokeObjectURL(url);this.urls=[];
-      for(const task of this.pending.values())task.reject(new Error('FFmpeg initialization was reset'));this.pending.clear();
+      for(const task of this.pending.values()){clearTimeout(task.timer);task.reject(new Error('FFmpeg initialization was reset'))}this.pending.clear();
     }
     receive({id,type,data}){
       if(type==='LOG'){this.logs.push(data?.message||String(data));if(this.logs.length>30)this.logs.shift();return}
       if(type==='PROGRESS'){this.progress(data||{});return}
-      const task=this.pending.get(id);if(!task)return;this.pending.delete(id);
+      const task=this.pending.get(id);if(!task)return;this.pending.delete(id);clearTimeout(task.timer);
       type==='ERROR'?task.reject(new Error(String(data))):task.resolve(data);
     }
-    request(type,data,transfer=[]){return new Promise((resolve,reject)=>{if(!this.worker){reject(new Error('FFmpeg worker is unavailable'));return}const id=this.nextID++;this.pending.set(id,{resolve,reject});this.worker.postMessage({id,type,data},transfer)})}
+    request(type,data,transfer=[],timeout=0){return new Promise((resolve,reject)=>{if(!this.worker){reject(new Error('FFmpeg worker is unavailable'));return}const id=this.nextID++;const timer=timeout?setTimeout(()=>{this.pending.delete(id);reject(new Error(`FFmpeg ${type.toLowerCase()} timed out`))},timeout):0;this.pending.set(id,{resolve,reject,timer});try{this.worker.postMessage({id,type,data},transfer)}catch(error){clearTimeout(timer);this.pending.delete(id);reject(error)}})}
     exec(args){return this.request('EXEC',{args,timeout:-1})}
     ffprobe(args){return this.request('FFPROBE',{args,timeout:-1})}
-    writeFile(path,data){const bytes=data instanceof Uint8Array?data:new Uint8Array(data);return this.request('WRITE_FILE',{path,data:bytes},[bytes.buffer])}
-    readFile(path){return this.request('READ_FILE',{path,encoding:'binary'})}
-    deleteFile(path){return this.request('DELETE_FILE',{path})}
+    writeFile(path,data){const bytes=data instanceof Uint8Array?data:new Uint8Array(data);return this.request('WRITE_FILE',{path,data:bytes},[bytes.buffer],300000)}
+    readFile(path){return this.request('READ_FILE',{path,encoding:'binary'},[],300000)}
+    deleteFile(path){return this.request('DELETE_FILE',{path},[],15000)}
   }
   function setProgress(value,message){$('progress').classList.add('active');$('progressFill').style.width=`${Math.max(0,Math.min(1,value))*100}%`;if(message)$('status').textContent=message}
   function parseRate(value){if(!value)return 25;const [a,b]=String(value).split('/').map(Number);return b?a/b:a||25}
@@ -552,6 +609,25 @@ self.onmessage=(event)=>{if(event.data&&event.data.type==='LOAD')event.data.data
   function ffText(bytes){return new TextDecoder().decode(bytes)}
   async function ffRun(args,label){
     const result=await ffmpeg.exec(args);if(result!==0)throw new Error(`${label} failed. ${ffmpeg.logs.slice(-3).join(' ')}`);return result;
+  }
+  async function compatibilityFFmpegExport(s,reason){
+    console.warn('Falling back to compatibility transcode',reason);
+    setProgress(.08,'Smart render was unsafe — starting compatibility transcode…');
+    if(!ffmpeg?.loaded){ffmpeg?.reset();ffmpeg=new BrowserFFmpeg();await ffmpeg.load()}
+    await ffmpeg.writeFile('input.mp4',new Uint8Array(await sourceFile.arrayBuffer()));
+    await ffmpeg.writeFile('overlay.png',await overlayPNG());
+    const duration=video.duration,fade=Math.max(.001,Math.min(s.fade,(s.end-s.start)/2));
+    const fadeOut=Math.max(s.start,s.end-fade),bitrate=Math.max(2500,Math.min(30000,Math.round(canvas.width*canvas.height*5/1000)));
+    const filter=`[1:v]format=rgba,fade=t=in:st=${s.start.toFixed(6)}:d=${fade.toFixed(6)}:alpha=1,fade=t=out:st=${fadeOut.toFixed(6)}:d=${fade.toFixed(6)}:alpha=1[ov];[0:v:0][ov]overlay=0:0:shortest=1:format=auto,format=yuv420p[v]`;
+    ffmpeg.progress=({progress})=>setProgress(.12+Math.max(0,Math.min(1,progress||0))*.78,'Creating compatibility MP4…');
+    await ffRun(['-y','-i','input.mp4','-loop','1','-i','overlay.png','-filter_complex',filter,'-map','[v]','-map','0:a:0?','-map_metadata','0','-sn','-dn','-c:v','libx264','-preset','fast','-profile:v','high','-tag:v','avc1','-pix_fmt','yuv420p','-b:v',`${bitrate}k`,'-maxrate',`${Math.round(bitrate*1.25)}k`,'-bufsize',`${Math.round(bitrate*2)}k`,'-c:a','aac','-b:a','192k','-ar','48000','-ac','2','-max_muxing_queue_size','4096','-t',duration.toFixed(6),'-movflags','+faststart','output.mp4'],'Compatibility transcode');
+    setProgress(.92,'Validating compatibility MP4…');
+    await ffmpeg.ffprobe(['-v','error','-select_streams','v:0','-show_entries','stream=codec_name,pix_fmt,duration:format=format_name,duration','-of','json','-o','verify.json','output.mp4']);
+    const check=JSON.parse(ffText(await ffmpeg.readFile('verify.json'))),stream=check.streams?.[0]||{},actual=Number(check.format?.duration||stream.duration)||0;
+    if(stream.codec_name!=='h264'||stream.pix_fmt!=='yuv420p'||actual<duration*.97)throw new Error('Compatibility MP4 validation failed.');
+    const output=await ffmpeg.readFile('output.mp4');if(output.byteLength<1024)throw new Error('Compatibility MP4 was empty.');
+    downloadBlob(new Blob([output],{type:'video/mp4'}),'keyed-compatible');
+    setProgress(1,'Compatibility MP4 exported (H.264 video + AAC audio)');
   }
   async function smartExport(){
     if(exporting||!sourceFile)return;const s=state();
@@ -599,21 +675,26 @@ self.onmessage=(event)=>{if(event.data&&event.data.type==='LOAD')event.data.data
       if(segEnd<duration-.01)await ffRun(['-v','error','-ss',Math.max(0,segEnd-.2).toFixed(3),'-t','0.6','-i','output.mp4','-map','0:v:0','-f','null','-'],'Ending splice validation');
       const output=await ffmpeg.readFile('output.mp4'),blob=new Blob([output],{type:'video/mp4'}),a=document.createElement('a');a.href=URL.createObjectURL(blob);a.download=`${sourceFile.name.replace(/\.[^.]+$/,'')}-keyed.mp4`;a.click();setTimeout(()=>URL.revokeObjectURL(a.href),30000);
       setProgress(1,`MP4 exported — rendered ${segDuration.toFixed(1)}s, copied ${(duration-segDuration).toFixed(1)}s`);
-    }catch(err){console.error(err);if(ffmpeg&&!ffmpeg.loaded){ffmpeg.reset();ffmpeg=null}$('status').textContent=err.message||'Smart export failed — use Seamless export';$('progress').classList.remove('active')}
+    }catch(err){
+      console.error(err);
+      try{await compatibilityFFmpegExport(s,err)}catch(fallbackError){console.error(fallbackError);if(ffmpeg&&!ffmpeg.loaded){ffmpeg.reset();ffmpeg=null}$('status').textContent=fallbackError.message||err.message||'FFmpeg export failed — use Seamless export';$('progress').classList.remove('active')}
+    }
     finally{for(const file of cleanup){try{await ffmpeg?.deleteFile(file)}catch{}}exporting=false;setExportControls(false);$('smartExportBtn').textContent='FFmpeg smart export (experimental)'}
   }
   async function exportVideo(){
     if(exporting||!video.src)return;const mime=pickMime();if(!mime){$('status').textContent='This browser cannot export video';return}
     exporting=true;setExportControls(true);$('exportBtn').textContent='Exporting in real time…';$('status').textContent='Keep this tab open';
     try{
-      await ensureAudio();await audioContext.resume();video.pause();video.currentTime=0;await new Promise(r=>video.addEventListener('seeked',r,{once:true}));draw();
+      await ensureAudio();await audioContext.resume();video.pause();video.currentTime=0;if(video.readyState<2)await waitForMedia(video,'seeked','error',10000);draw();
       const canvasStream=canvas.captureStream(Math.min(30,Math.round((video.getVideoPlaybackQuality?30:25))));const stream=new MediaStream([...canvasStream.getVideoTracks(),...audioDest.stream.getAudioTracks()]);
       const chunks=[];recorder=new MediaRecorder(stream,{mimeType:mime,videoBitsPerSecond:Math.max(5_000_000,canvas.width*canvas.height*4)});recorder.ondataavailable=e=>{if(e.data.size)chunks.push(e.data)};
-      const stopped=new Promise(resolve=>recorder.onstop=resolve);recorder.start(1000);await video.play();$('playBtn').textContent='❚❚';startLoop();
-      await new Promise(resolve=>video.addEventListener('ended',resolve,{once:true}));draw();recorder.stop();await stopped;
-      const blob=new Blob(chunks,{type:mime});const ext=mime.startsWith('video/mp4')?'mp4':'webm';const a=document.createElement('a');a.href=URL.createObjectURL(blob);a.download=`${($('filename').textContent||'video').replace(/\.[^.]+$/,'')}-keyed.${ext}`;a.click();setTimeout(()=>URL.revokeObjectURL(a.href),30000);
+      const stopped=new Promise((resolve,reject)=>{recorder.onstop=resolve;recorder.onerror=e=>reject(e.error||new Error('Media recorder failed'))});
+      recorder.start(1000);await video.play();$('playBtn').textContent='❚❚';startLoop();
+      await Promise.race([waitForMedia(video,'ended','error',Math.max(30000,(video.duration+30)*1000)),stopped.then(()=>{throw new Error('Media recorder stopped before playback completed')})]);draw();
+      if(recorder.state!=='inactive'){recorder.requestData();recorder.stop()}await stopped;stream.getTracks().forEach(track=>track.stop());
+      const blob=new Blob(chunks,{type:mime});if(blob.size<1024)throw new Error('The recorded video was empty');const ext=mime.startsWith('video/mp4')?'mp4':'webm';const a=document.createElement('a');a.href=URL.createObjectURL(blob);a.download=`${($('filename').textContent||'video').replace(/\.[^.]+$/,'')}-keyed.${ext}`;a.click();setTimeout(()=>URL.revokeObjectURL(a.href),30000);
       $('status').textContent=ext==='mp4'?'MP4 exported':'Exported WebM (MP4 unavailable in this browser)';
-    }catch(err){console.error(err);$('status').textContent='Export failed — try Chrome or Safari'}finally{exporting=false;setExportControls(false);$('exportBtn').textContent='Seamless export (real-time)';$('playBtn').textContent='▶'}
+    }catch(err){console.error(err);if(recorder?.state&&recorder.state!=='inactive')try{recorder.stop()}catch{}$('status').textContent=err.message||'Export failed — try Chrome or Safari'}finally{video.pause();exporting=false;setExportControls(false);$('exportBtn').textContent='Seamless export (real-time)';$('playBtn').textContent='▶'}
   }
   // Seed the first key from the default input values, then keep the inputs bound to it.
   keys=[makeKey({name:$('name').value,role:$('role').value,uppercase:$('uppercase').checked,start:+$('start').value||0,end:+$('end').value||0,fade:+$('fade').value||0,x:+$('posX').value,y:+$('posY').value,nameSize:+$('nameSize').value,roleSize:+$('roleSize').value,shadow:$('shadow').checked})];
