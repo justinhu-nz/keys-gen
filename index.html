@@ -109,6 +109,7 @@
       <button class="primary dl" id="dlBtn" disabled>Download</button>
       <button class="primary dl-arrow" id="dlArrow" disabled aria-label="Export options">▾</button>
       <div class="dl-menu" id="dlMenu">
+        <button class="menu-item" id="broadcastExportBtn" disabled>Broadcast MXF — DNxHD 120</button>
         <button class="menu-item" id="smartExportBtn" disabled>FFmpeg smart export (experimental)</button>
         <button class="menu-item" id="exportBtn" disabled>Seamless export (real-time)</button>
       </div>
@@ -117,7 +118,7 @@
   </header>
   <div class="export-bar" id="exportBar">
     <div class="progress" id="progress"><i id="progressFill"></i></div>
-    <div class="status" id="status">Add a video to begin</div>
+    <div class="status" id="status">Add a video to begin</div><button class="ghost" id="cancelExportBtn" hidden>Cancel export</button>
   </div>
   <main>
     <section class="stage">
@@ -195,7 +196,7 @@ const FFMPEG_CORE_WASM_B64='AGFzbQEAAAABmBagAmADf39/AGAEf39/fwBgAn9/AGABfwF/YAR/
   const $ = id => document.getElementById(id);
   const video=$('video'), canvas=$('canvas'), ctx=canvas.getContext('2d',{alpha:false});
   const controls=['name','role','uppercase','start','end','fade','posX','posY','nameSize','roleSize','shadow'];
-  let objectURL='', sourceFile=null, drawing=false, exporting=false, recorder=null, audioContext=null, audioSource=null, audioDest=null, ffmpeg=null, mp4box=null, keyFontsReady=false, keyFontsPromise=null;
+  let objectURL='',sourceFile=null,desktopSourcePath='',desktopProbe=null,activeDesktopJob='',drawing=false,exporting=false,recorder=null,audioContext=null,audioSource=null,audioDest=null,ffmpeg=null,mp4box=null,keyFontsReady=false,keyFontsPromise=null;
   // Multi-key model: each key is an independent lower third. The sidebar inputs always edit `selectedId`.
   let keys=[], selectedId=0, nextKeyId=1;
   const makeKey=(o={})=>Object.assign({id:nextKeyId++,name:'CHRIS HIPKINS',role:'Labour Leader',uppercase:true,start:0,end:5,fade:.35,x:5.625,y:75,nameSize:65,roleSize:45,shadow:false},o);
@@ -315,20 +316,32 @@ const FFMPEG_CORE_WASM_B64='AGFzbQEAAAABmBagAmADf39/AGAEf39/fwBgAn9/AGABfwF/YAR/
       timer=setTimeout(()=>done(new Error(`Timed out waiting for video ${success}`)),timeout);
     });
   }
+  async function finishLoadedSource(name){
+    await waitForMedia(video,'loadedmetadata');
+    if(!Number.isFinite(video.duration)||video.duration<=0||!video.videoWidth||!video.videoHeight)throw new Error('The video has invalid or unsupported media metadata.');
+    await ensureKeyFonts(allKeyText());
+    canvas.width=video.videoWidth;canvas.height=video.videoHeight;$('scrubber').max=video.duration;$('duration').textContent=fmt(video.duration);
+    $('end').value=Math.min(5,video.duration).toFixed(1);$('start').max=video.duration;$('end').max=video.duration;
+    $('filename').textContent=name;$('empty').style.display='none';$('videoWrap').classList.add('active');$('transport').classList.add('active');$('fileline').classList.add('active');
+    $('hardwareExportBtn').disabled=false;$('exportBtn').disabled=false;$('smartExportBtn').disabled=false;
+    if($('broadcastExportBtn'))$('broadcastExportBtn').disabled=!desktopSourcePath;
+    $('status').textContent=desktopSourcePath?'Ready — native broadcast export available':'Ready to export';updateOutputs();draw();
+  }
   async function loadFile(file){
     if(!file||(!file.type.startsWith('video/')&&!/\.(mp4|m4v|mov|webm|mkv|avi|mpeg|mpg)$/i.test(file.name)))return;
+    desktopSourcePath='';desktopProbe=null;
     const nextURL=URL.createObjectURL(file);video.pause();video.removeAttribute('src');video.load();
     if(objectURL)URL.revokeObjectURL(objectURL);objectURL=nextURL;sourceFile=file;video.src=objectURL;video.load();
     $('filename').textContent=file.name;$('status').textContent='Reading video…';
     try{
-      await waitForMedia(video,'loadedmetadata');
-      if(!Number.isFinite(video.duration)||video.duration<=0||!video.videoWidth||!video.videoHeight)throw new Error('The video has invalid or unsupported media metadata.');
-      await ensureKeyFonts(allKeyText());
-      canvas.width=video.videoWidth;canvas.height=video.videoHeight;$('scrubber').max=video.duration;$('duration').textContent=fmt(video.duration);
-      $('end').value=Math.min(5,video.duration).toFixed(1);$('start').max=video.duration;$('end').max=video.duration;
-      $('empty').style.display='none';$('videoWrap').classList.add('active');$('transport').classList.add('active');$('fileline').classList.add('active');$('hardwareExportBtn').disabled=false;$('exportBtn').disabled=false;$('smartExportBtn').disabled=false;
-      $('status').textContent='Ready to export';updateOutputs();draw();
+      await finishLoadedSource(file.name);
     }catch(error){console.error(error);sourceFile=null;$('status').textContent=error.message||'This video cannot be opened in this browser';video.removeAttribute('src');video.load()}
+  }
+  async function chooseDesktopVideo(){
+    const selected=await window.desktopStudio.chooseVideo();if(!selected)return;
+    video.pause();video.removeAttribute('src');video.load();if(objectURL)URL.revokeObjectURL(objectURL);objectURL='';sourceFile=null;
+    desktopSourcePath=selected.sourcePath;desktopProbe=selected.probe;video.src=selected.url;video.load();$('status').textContent='Reading video…';
+    try{await finishLoadedSource(selected.name)}catch(error){console.error(error);desktopSourcePath='';desktopProbe=null;$('status').textContent=`Preview unavailable: ${error.message}`;video.removeAttribute('src');video.load()}
   }
   function updateOutputs(){syncInputsToKey();refreshLabels();keysChanged()}
   async function togglePlay(){if(!video.src)return;if(video.ended)video.currentTime=0;if(video.paused){try{await video.play();$('playBtn').textContent='❚❚';startLoop()}catch(error){console.error(error);$('status').textContent='Playback could not start for this video'}}else{video.pause();$('playBtn').textContent='▶';draw()}}
@@ -343,6 +356,7 @@ const FFMPEG_CORE_WASM_B64='AGFzbQEAAAABmBagAmADf39/AGAEf39/fwBgAn9/AGABfwF/YAR/
   }
   function setExportControls(disabled){
     $('hardwareExportBtn').disabled=disabled;$('smartExportBtn').disabled=disabled;$('exportBtn').disabled=disabled;
+    if($('broadcastExportBtn'))$('broadcastExportBtn').disabled=disabled||!desktopSourcePath;
   }
   function loadMP4Box(){
     if(mp4box)return mp4box;
@@ -696,11 +710,35 @@ self.onmessage=(event)=>{if(event.data&&event.data.type==='LOAD')event.data.data
       $('status').textContent=ext==='mp4'?'MP4 exported':'Exported WebM (MP4 unavailable in this browser)';
     }catch(err){console.error(err);if(recorder?.state&&recorder.state!=='inactive')try{recorder.stop()}catch{}$('status').textContent=err.message||'Export failed — try Chrome or Safari'}finally{video.pause();exporting=false;setExportControls(false);$('exportBtn').textContent='Seamless export (real-time)';$('playBtn').textContent='▶'}
   }
+  async function nativeOverlay(k){
+    const layer=document.createElement('canvas');layer.width=1920;layer.height=1080;
+    const context=layer.getContext('2d');drawKeyLayer(context,layer.width,layer.height,1,computed(k));
+    const blob=await new Promise((resolve,reject)=>layer.toBlob(value=>value?resolve(value):reject(new Error('Could not render a broadcast overlay.')),'image/png'));
+    return {png:new Uint8Array(await blob.arrayBuffer()),start:k.start,end:k.end,fade:k.fade};
+  }
+  async function broadcastExport(){
+    if(exporting||!desktopSourcePath||!window.desktopStudio)return;
+    exporting=true;setExportControls(true);video.pause();$('cancelExportBtn').hidden=false;$('broadcastExportBtn').textContent='Exporting broadcast MXF…';
+    try{
+      syncInputsToKey();await ensureKeyFonts(allKeyText());setProgress(.01,'Rendering lower-third layers…');
+      const overlays=[];for(const key of keys)overlays.push(await nativeOverlay(key));
+      const result=await window.desktopStudio.exportBroadcast({sourcePath:desktopSourcePath,overlays});
+      if(result?.canceled){$('status').textContent='Export canceled';$('progress').classList.remove('active')}
+      else if(result?.outputPath){setProgress(1,`Broadcast MXF saved: ${result.outputPath}`)}
+    }catch(error){console.error(error);$('status').textContent=error.message||'Broadcast export failed';$('progress').classList.remove('active')}
+    finally{activeDesktopJob='';$('cancelExportBtn').hidden=true;exporting=false;setExportControls(false);$('broadcastExportBtn').textContent='Broadcast MXF — DNxHD 120'}
+  }
+  if(window.desktopStudio){
+    $('formatBadge').textContent='Desktop • Native FFmpeg • Offline';
+    window.desktopStudio.onExportProgress(update=>{activeDesktopJob=update.jobId||activeDesktopJob;setProgress(update.progress||0,update.message)});
+    $('broadcastExportBtn').onclick=broadcastExport;
+    $('cancelExportBtn').onclick=async()=>{if(activeDesktopJob){$('status').textContent='Canceling export…';await window.desktopStudio.cancelExport(activeDesktopJob)}};
+  }else{$('broadcastExportBtn').style.display='none'}
   // Seed the first key from the default input values, then keep the inputs bound to it.
   keys=[makeKey({name:$('name').value,role:$('role').value,uppercase:$('uppercase').checked,start:+$('start').value||0,end:+$('end').value||0,fade:+$('fade').value||0,x:+$('posX').value,y:+$('posY').value,nameSize:+$('nameSize').value,roleSize:+$('roleSize').value,shadow:$('shadow').checked})];
   selectedId=keys[0].id;renderKeyList();
   $('addKeyBtn').onclick=addKey;
-  $('chooseBtn').onclick=$('replaceBtn').onclick=()=>$('fileInput').click();$('fileInput').onchange=e=>loadFile(e.target.files[0]);$('playBtn').onclick=togglePlay;$('hardwareExportBtn').onclick=hardwareExport;$('smartExportBtn').onclick=smartExport;$('exportBtn').onclick=exportVideo;
+  $('chooseBtn').onclick=$('replaceBtn').onclick=()=>window.desktopStudio?chooseDesktopVideo():$('fileInput').click();$('fileInput').onchange=e=>loadFile(e.target.files[0]);$('playBtn').onclick=togglePlay;$('hardwareExportBtn').onclick=hardwareExport;$('smartExportBtn').onclick=smartExport;$('exportBtn').onclick=exportVideo;
   $('scrubber').oninput=e=>{video.currentTime=+e.target.value;draw()};video.onpause=()=>{$('playBtn').textContent='▶';draw()};video.onplay=()=>{$('playBtn').textContent='❚❚';startLoop()};
   controls.forEach(id=>{$(id).addEventListener('input',updateOutputs);$(id).addEventListener('change',updateOutputs)});
   const dz=$('dropzone');['dragenter','dragover'].forEach(ev=>dz.addEventListener(ev,e=>{e.preventDefault();dz.classList.add('drag')}));['dragleave','drop'].forEach(ev=>dz.addEventListener(ev,e=>{e.preventDefault();dz.classList.remove('drag')}));dz.addEventListener('drop',e=>loadFile(e.dataTransfer.files[0]));
@@ -853,15 +891,18 @@ self.onmessage=(event)=>{if(event.data&&event.data.type==='LOAD')event.data.data
   });
   // Toolbar split Download button: proxies the hidden hardware export button so the
   // studio IIFE keeps owning export state; menu items are the original export buttons.
-  const dlBtn=$('dlBtn'),dlArrow=$('dlArrow'),dlMenu=$('dlMenu'),hwBtn=$('hardwareExportBtn');
-  dlBtn.onclick=()=>hwBtn.click();
+  const dlBtn=$('dlBtn'),dlArrow=$('dlArrow'),dlMenu=$('dlMenu'),hwBtn=$('hardwareExportBtn'),broadcastBtn=$('broadcastExportBtn');
+  const primaryExport=()=>window.desktopStudio?broadcastBtn:hwBtn;
+  dlBtn.onclick=()=>primaryExport().click();
   dlArrow.onclick=e=>{e.stopPropagation();dlMenu.classList.toggle('open')};
   dlMenu.addEventListener('click',()=>dlMenu.classList.remove('open'));
   document.addEventListener('pointerdown',e=>{if(!dlMenu.contains(e.target)&&e.target!==dlArrow)dlMenu.classList.remove('open')});
-  new MutationObserver(()=>{
-    dlBtn.disabled=dlArrow.disabled=hwBtn.disabled;
-    dlBtn.textContent=hwBtn.disabled&&hwBtn.textContent.includes('…')?'Exporting…':'Download';
-  }).observe(hwBtn,{attributes:true,attributeFilter:['disabled'],childList:true,subtree:true,characterData:true});
+  const syncDownloadButton=()=>{
+    const primary=primaryExport();dlBtn.disabled=dlArrow.disabled=primary.disabled;
+    dlBtn.textContent=primary.disabled&&primary.textContent.includes('…')?'Exporting…':window.desktopStudio?'Export MXF':'Download';
+  };
+  const exportObserver=new MutationObserver(syncDownloadButton),observerOptions={attributes:true,attributeFilter:['disabled'],childList:true,subtree:true,characterData:true};
+  exportObserver.observe(hwBtn,observerOptions);exportObserver.observe(broadcastBtn,observerOptions);syncDownloadButton();
   // The studio IIFE only redraws on control input; nudge it once frames are decodable.
   const requestDraw=()=>$('posX').dispatchEvent(new Event('input'));
   video.addEventListener('loadeddata',()=>{if(video.currentTime===0)video.currentTime=.01;requestDraw()});
